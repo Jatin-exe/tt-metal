@@ -323,6 +323,25 @@ void set_or_update_runtime_arguments(
         if (!aligned_for_a || !aligned_for_b || !aligned_for_c) {
             num_rows_per_tile = 1;
         }
+        // Column/scalar RM broadcast readers keep one aligned seed read in tail scratch, so the packed rows must
+        // leave enough space at the end of the CB page for that temporary buffer.
+        const auto limit_rows_for_column_bcast_source = [&](const Tensor& src, const uint32_t src_alignment) {
+            const uint32_t tile_bytes = tile_hw * src.element_size();
+            const uint32_t row_bytes = common_row_width_elements * src.element_size();
+            const uint32_t scratch_bytes = tt::round_up(src.element_size(), src_alignment);
+            num_rows_per_tile =
+                std::min(num_rows_per_tile, std::max<uint32_t>(1u, (tile_bytes - scratch_bytes) / row_bytes));
+        };
+        switch (operation_attributes.subtile_broadcast_type) {
+            case SubtileBroadcastType::COL_A:
+            case SubtileBroadcastType::ROW_B_COL_A: limit_rows_for_column_bcast_source(a, a_alignment); break;
+            case SubtileBroadcastType::COL_B:
+            case SubtileBroadcastType::ROW_A_COL_B:
+                TT_FATAL(b.has_value(), "Column broadcast requires rhs tensor");
+                limit_rows_for_column_bcast_source(*b, b_alignment);
+                break;
+            default: break;
+        }
 
         row_blocks_per_channel = tt::div_up(cHt_r, num_rows_per_tile);
         const uint32_t total_row_blocks = cND * cD * cN * cC * row_blocks_per_channel;

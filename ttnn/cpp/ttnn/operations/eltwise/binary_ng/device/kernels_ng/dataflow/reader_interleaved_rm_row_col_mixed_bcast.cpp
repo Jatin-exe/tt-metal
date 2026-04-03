@@ -160,7 +160,8 @@ void kernel_main() {
                                 const uint32_t row_idx_a = row_block_a + static_cast<uint32_t>(k) * s_h_a;
                                 const uint64_t addr_a = get_noc_addr(row_idx_a, src);
                                 const uint32_t src_low_bits = static_cast<uint32_t>(addr_a & 0xF);
-                                const uint32_t scratch_l1_addr = l1_write_addr_src + src_low_bits;
+                                const uint32_t scratch_l1_addr =
+                                    l1_write_addr_src + src_tile_bytes - element_size_aligned_a + src_low_bits;
                                 const uint32_t row_l1_addr =
                                     l1_write_addr_src + static_cast<uint32_t>(k) * current_chunk_bytes;
 
@@ -182,7 +183,8 @@ void kernel_main() {
                                 const uint32_t row_idx_b = row_block_b + static_cast<uint32_t>(k) * s_h_b;
                                 const uint64_t addr_b = get_noc_addr(row_idx_b, src_b);
                                 const uint32_t src_low_bits = static_cast<uint32_t>(addr_b & 0xF);
-                                const uint32_t scratch_l1_addr = l1_write_addr_src_b + src_low_bits;
+                                const uint32_t scratch_l1_addr =
+                                    l1_write_addr_src_b + src_tile_bytes - element_size_aligned_b + src_low_bits;
                                 const uint32_t row_l1_addr =
                                     l1_write_addr_src_b + static_cast<uint32_t>(k) * current_chunk_bytes;
 
