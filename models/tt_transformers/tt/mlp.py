@@ -151,9 +151,9 @@ class MLP(LightweightModule):
             program_config=pc_1,
             memory_config=self.args.get_mlp_ff1_3_mem_config(mode, self.prefetcher),
             global_cb=self.prefetcher.global_cb if self.prefetcher is not None and mode == Mode.DECODE else None,
-            sub_device_id=self.prefetcher.worker_sub_device_id
-            if self.prefetcher is not None and mode == Mode.DECODE
-            else None,
+            sub_device_id=(
+                self.prefetcher.worker_sub_device_id if self.prefetcher is not None and mode == Mode.DECODE else None
+            ),
         )
         w3_out = ttnn.linear(
             x,
@@ -164,9 +164,9 @@ class MLP(LightweightModule):
             program_config=pc_3,
             memory_config=self.args.get_mlp_ff1_3_mem_config(mode, self.prefetcher),
             global_cb=self.prefetcher.global_cb if self.prefetcher is not None and mode == Mode.DECODE else None,
-            sub_device_id=self.prefetcher.worker_sub_device_id
-            if self.prefetcher is not None and mode == Mode.DECODE
-            else None,
+            sub_device_id=(
+                self.prefetcher.worker_sub_device_id if self.prefetcher is not None and mode == Mode.DECODE else None
+            ),
         )
         ttnn.deallocate(x)
 
@@ -243,7 +243,9 @@ class MLP(LightweightModule):
 
         if mode == Mode.DECODE and not TG and self.prefetcher is None:
             # w2 may use a different core grid, this is a no-op if they already match
-            w2_in = ttnn.to_memory_config(w2_in, self.args.get_mlp_binary_mult_mem_config(mode))
+            w2_input_mem_config = self.args.get_mlp_binary_mult_mem_config(mode)
+            if w2_in.memory_config() != w2_input_mem_config:
+                w2_in = ttnn.to_memory_config(w2_in, w2_input_mem_config)
 
         ttnn.deallocate(w3_out)
         ttnn.deallocate(w1_out)
@@ -289,9 +291,11 @@ class MLP(LightweightModule):
                 memory_config=self.args.get_mlp_ff2_mem_config(mode, self.prefetcher),
                 core_grid=None,  # FIXME: validate on TG ttnn.CoreGrid(y=8, x=8) if not pc_2 else None,
                 global_cb=self.prefetcher.global_cb if self.prefetcher is not None and mode == Mode.DECODE else None,
-                sub_device_id=self.prefetcher.worker_sub_device_id
-                if self.prefetcher is not None and mode == Mode.DECODE
-                else None,
+                sub_device_id=(
+                    self.prefetcher.worker_sub_device_id
+                    if self.prefetcher is not None and mode == Mode.DECODE
+                    else None
+                ),
             )
         ttnn.deallocate(w2_in)
 
@@ -303,30 +307,36 @@ class MLP(LightweightModule):
             dim=0 if (TG and self.dim < 8192) else 3,
             sharded=(mode == Mode.DECODE),
             memory_config=self.args.get_mlp_ff2_all_reduce_mem_config(mode, w2_out),
-            rs_memory_config=self.model_config["MLP_RS_CONFIG"]["rs_memory_config"]
-            if mode == Mode.DECODE
-            else ttnn.DRAM_MEMORY_CONFIG,
+            rs_memory_config=(
+                self.model_config["MLP_RS_CONFIG"]["rs_memory_config"]
+                if mode == Mode.DECODE
+                else ttnn.DRAM_MEMORY_CONFIG
+            ),
             dtype=self.args.ccl_dtype,
             use_composite=True if self.dim == 8192 else False,
             topology=self.args.ccl_topology(),
             chunks_per_sync=self.model_config["MLP_RS_CONFIG"]["chunks_per_sync"] if mode == Mode.DECODE else 10,
-            num_workers_per_link=self.model_config["MLP_RS_CONFIG"]["num_workers_per_link"]
-            if mode == Mode.DECODE
-            else 2,
-            subdevice_id=self.prefetcher.worker_sub_device_id
-            if mode == Mode.DECODE and self.prefetcher is not None
-            else None,
+            num_workers_per_link=(
+                self.model_config["MLP_RS_CONFIG"]["num_workers_per_link"] if mode == Mode.DECODE else 2
+            ),
+            subdevice_id=(
+                self.prefetcher.worker_sub_device_id if mode == Mode.DECODE and self.prefetcher is not None else None
+            ),
         )
         # Ensure dim 0 and 1 are 1
         original_shape = w2_out_reduced.shape
-        w2_out_reduced = ttnn.reshape(
-            w2_out_reduced, (1, 1, original_shape[-4] * original_shape[-3] * original_shape[-2], original_shape[-1])
-        )
+        if original_shape[0] != 1 or original_shape[1] != 1:
+            w2_out_reduced = ttnn.reshape(
+                w2_out_reduced,
+                (1, 1, original_shape[-4] * original_shape[-3] * original_shape[-2], original_shape[-1]),
+            )
 
         if mode == Mode.DECODE:
-            w2_out_reduced = ttnn.to_memory_config(
-                w2_out_reduced,
-                self.args.get_mlp_output_mem_config(mode, self.prefetcher),
-            )
+            output_mem_config = self.args.get_mlp_output_mem_config(mode, self.prefetcher)
+            if w2_out_reduced.memory_config() != output_mem_config:
+                w2_out_reduced = ttnn.to_memory_config(
+                    w2_out_reduced,
+                    output_mem_config,
+                )
 
         return w2_out_reduced

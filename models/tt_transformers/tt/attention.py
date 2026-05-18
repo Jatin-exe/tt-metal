@@ -521,6 +521,36 @@ class Attention(LightweightModule):
         return q_heads_1BQD, k_heads_1BKD
 
     def _hf_rope_decode(self, q_heads_pre_rot_1BQD, k_heads_pre_rot_1BKD, rot_mats, current_pos):
+        if getattr(self.args, "higgs_legacy_hf_rope_decode", False):
+            if q_heads_pre_rot_1BQD.dtype != ttnn.bfloat16:
+                q_heads_pre_rot_1BQD = ttnn.typecast(q_heads_pre_rot_1BQD, dtype=ttnn.bfloat16)
+            if k_heads_pre_rot_1BKD.dtype != ttnn.bfloat16:
+                k_heads_pre_rot_1BKD = ttnn.typecast(k_heads_pre_rot_1BKD, dtype=ttnn.bfloat16)
+            int_current_pos = int(ttnn.to_torch(ttnn.get_device_tensors(current_pos)[0])[0])
+            q_heads_1BQD = ttnn.experimental.rotary_embedding(
+                q_heads_pre_rot_1BQD,
+                rot_mats[0],
+                rot_mats[1],
+                int_current_pos,
+            )
+            k_heads_1BKD = ttnn.experimental.rotary_embedding(
+                k_heads_pre_rot_1BKD,
+                rot_mats[0],
+                rot_mats[1],
+                int_current_pos,
+            )
+            q_heads_1BQD = ttnn.reshape(
+                q_heads_1BQD,
+                (1, self.batch_size_per_device_group, self.n_local_heads, self.head_dim),
+                (1, self.batch_size_per_device_group, 32, self.head_dim),
+            )
+            k_heads_1BKD = ttnn.reshape(
+                k_heads_1BKD,
+                (1, self.batch_size_per_device_group, self.n_local_kv_heads, self.head_dim),
+                (1, self.batch_size_per_device_group, 32, self.head_dim),
+            )
+            return q_heads_1BQD[:, :, : self.n_local_heads], k_heads_1BKD[:, :, : self.n_local_kv_heads]
+
         cos, sin = rot_mats[0], rot_mats[1]
         # Must match padded batch in rot_mats (rope) and nlp_create_qkv_heads_decode output; avoids
         # ttnn.Tensor.shape host read for graph capture / trace.
@@ -586,6 +616,12 @@ class Attention(LightweightModule):
         return q_heads_1BQD, k_heads_1BKD
 
     def _mllama_rope_prefill(self, q_heads_1QSD_pre_rot, k_heads_1KSD_pre_rot, rot_mats):
+        if getattr(self.args, "higgs_rope_prefill_bf16", False):
+            if q_heads_1QSD_pre_rot.dtype != ttnn.bfloat16:
+                q_heads_1QSD_pre_rot = ttnn.typecast(q_heads_1QSD_pre_rot, dtype=ttnn.bfloat16)
+            if k_heads_1KSD_pre_rot.dtype != ttnn.bfloat16:
+                k_heads_1KSD_pre_rot = ttnn.typecast(k_heads_1KSD_pre_rot, dtype=ttnn.bfloat16)
+
         q_heads_1QSD = ttnn.experimental.rotary_embedding_llama(
             q_heads_1QSD_pre_rot,
             rot_mats[0],
@@ -655,22 +691,25 @@ class Attention(LightweightModule):
             xqkv_fused_sharded = xqkv_fused_sharded + self.wqkv_bias_decode[num_tiles - 1]
 
         ttnn.deallocate(x)
-        qkv_all_reduce_mem_cfg = self.args.get_attn_qkv_all_reduce_output_mem_config(
-            Mode.DECODE, list(self.mesh_device.shape)[1], self.prefetcher
-        )
-        xqkv_fused = tt_all_reduce(
-            xqkv_fused_sharded,
-            self.mesh_device,
-            self.tt_ccl,
-            cluster_axis=1,
-            memory_config=qkv_all_reduce_mem_cfg
-            if qkv_all_reduce_mem_cfg is not None
-            else xqkv_fused_sharded.memory_config(),
-            sharded=True,
-            dtype=self.ccl_dtype,
-            topology=self.ccl_topology,
-            subdevice_id=self.prefetcher.worker_sub_device_id if self.prefetcher is not None else None,
-        )
+        if not getattr(self.args, "higgs_skip_qkv_all_reduce", False):
+            qkv_all_reduce_mem_cfg = self.args.get_attn_qkv_all_reduce_output_mem_config(
+                Mode.DECODE, list(self.mesh_device.shape)[1], self.prefetcher
+            )
+            xqkv_fused = tt_all_reduce(
+                xqkv_fused_sharded,
+                self.mesh_device,
+                self.tt_ccl,
+                cluster_axis=1,
+                memory_config=(
+                    qkv_all_reduce_mem_cfg if qkv_all_reduce_mem_cfg is not None else xqkv_fused_sharded.memory_config()
+                ),
+                sharded=True,
+                dtype=self.ccl_dtype,
+                topology=self.ccl_topology,
+                subdevice_id=self.prefetcher.worker_sub_device_id if self.prefetcher is not None else None,
+            )
+        else:
+            xqkv_fused = xqkv_fused_sharded
         if self.TG:
             # TODO: Slice the fused_query_key_value tensor get batch=8
             xqkv_fused = ttnn.matmul(
@@ -776,12 +815,16 @@ class Attention(LightweightModule):
             )
 
         ttnn.deallocate(q_heads_1BQD)
-        attn_output_11BH = ttnn.to_memory_config(
-            attn_output_1G4D,
-            memory_config=self.args.get_attn_sdpa_output_mem_config(
-                Mode.DECODE, self.batch_size_per_device_group, self.prefetcher
-            ),
+        concat_input_mem_config = self.args.get_attn_sdpa_output_mem_config(
+            Mode.DECODE, self.batch_size_per_device_group, self.prefetcher
         )
+        if attn_output_1G4D.memory_config() == concat_input_mem_config:
+            attn_output_11BH = attn_output_1G4D
+        else:
+            attn_output_11BH = ttnn.to_memory_config(
+                attn_output_1G4D,
+                memory_config=concat_input_mem_config,
+            )
 
         attn_output_cat = ttnn.experimental.nlp_concat_heads_decode(
             attn_output_11BH,
@@ -789,7 +832,8 @@ class Attention(LightweightModule):
             sub_core_grids=self.prefetcher.all_worker_cores_range_set if self.prefetcher is not None else None,
         )
         ttnn.deallocate(attn_output_11BH)
-        ttnn.deallocate(attn_output_1G4D)
+        if attn_output_11BH is not attn_output_1G4D:
+            ttnn.deallocate(attn_output_1G4D)
 
         if self.use_fused_all_gather_matmul or self.prefetcher is not None:
             attn_output_cat = ttnn.to_memory_config(
@@ -882,7 +926,15 @@ class Attention(LightweightModule):
                 core_grid=ttnn.CoreGrid(y=4, x=8) if self.TG else None,
                 program_config=self.args.get_attn_wo_program_config(Mode.DECODE, 1, self.prefetcher),
                 memory_config=self.args.get_attn_wo_output_mem_config(Mode.DECODE, self.prefetcher),
-                dtype=ttnn.bfloat8_b if self.TG else None,
+                dtype=(
+                    ttnn.bfloat8_b
+                    if self.TG
+                    else (
+                        (self.activation_dtype or ttnn.bfloat16)
+                        if getattr(self.args, "higgs_attention_output_activation_dtype", False)
+                        else None
+                    )
+                ),
                 compute_kernel_config=self.li_o_decode_compute_kernel_cfg,
                 global_cb=self.prefetcher.global_cb if self.prefetcher is not None else None,
                 sub_device_id=self.prefetcher.worker_sub_device_id if self.prefetcher is not None else None,
@@ -891,6 +943,7 @@ class Attention(LightweightModule):
             ttnn.deallocate(attn_output_cat)
 
             # All reduce
+            attn_rs_config = self.model_config.get("ATTN_RS_CONFIG", self.model_config.get("MLP_RS_CONFIG", {}))
             dense_out_reduced = tt_all_reduce(
                 dense_out_sharded,
                 self.mesh_device,
@@ -904,13 +957,16 @@ class Attention(LightweightModule):
                 sharded=True,
                 dtype=self.ccl_dtype,
                 use_composite=True if self.hidden_size == 8192 else False,
+                rs_memory_config=attn_rs_config.get("rs_memory_config", ttnn.DRAM_MEMORY_CONFIG),
+                chunks_per_sync=attn_rs_config.get("chunks_per_sync", 10),
+                num_workers_per_link=attn_rs_config.get("num_workers_per_link", 2),
                 subdevice_id=self.prefetcher.worker_sub_device_id if self.prefetcher is not None else None,
             )
 
             if not self.TG:
-                dense_out_reduced = ttnn.to_memory_config(
-                    dense_out_reduced, self.args.get_attn_dense_output_mem_config(Mode.DECODE, None)
-                )
+                dense_out_mem_config = self.args.get_attn_dense_output_mem_config(Mode.DECODE, None)
+                if dense_out_reduced.memory_config() != dense_out_mem_config:
+                    dense_out_reduced = ttnn.to_memory_config(dense_out_reduced, dense_out_mem_config)
 
             return dense_out_reduced
 
